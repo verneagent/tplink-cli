@@ -111,11 +111,13 @@ async function cmdStatus(stok) {
   console.log(`  Features  BandSteering:${sp.wifison==='1'?'ON':'OFF'}  HWNAT:${sp.hnat==='1'?'ON':'OFF'}`);
 
   console.log(`\n  Devices (${hosts.length})`);
+  console.log(`  TYPE  HOSTNAME                              IP               MAC                SPEED`);
+  console.log(`  ────  ────────────────────────────────────  ───────────────  ─────────────────  ─────`);
   for (const h of hosts.sort((a, b) => (a.wifi_mode||'').localeCompare(b.wifi_mode||''))) {
-    const t = h.type === '0' ? 'ETH' : h.wifi_mode === '0' ? '2.4G' : h.wifi_mode === '1' ? '5G ' : '?';
+    const t = h.type === '0' ? 'ETH' : h.wifi_mode === '0' ? '2.4G' : h.wifi_mode === '1' ? '5G ' : '  ?';
     const n = decodeURIComponent((h.hostname||'').replace(/\+/g,' ')) || '(unnamed)';
-    const s = h.down_speed !== '0' ? ` ↓${h.down_speed}KB/s` : '';
-    console.log(`  ${t}  ${n.padEnd(35)} ${(h.ip||'-').padEnd(16)} ${h.mac}${s}`);
+    const s = h.down_speed !== '0' ? `${h.down_speed}` : '';
+    console.log(`  ${t}   ${n.padEnd(37)} ${(h.ip||'-').padEnd(16)} ${h.mac.padEnd(18)} ${s}`);
   }
 }
 
