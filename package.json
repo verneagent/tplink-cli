@@ -1,0 +1,10 @@
+{
+  "name": "tplink-cli",
+  "version": "4.0.0",
+  "description": "TP-Link EasyMesh router CLI",
+  "license": "MIT",
+  "bin": {
+    "tplink": "./tplink.js"
+  },
+  "files": ["tplink.js"]
+}
