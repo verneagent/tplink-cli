@@ -21,6 +21,7 @@
 //   node tplink.js -p mypass raw '{"device_info":{"name":"info"}}'
 
 const CONFIG = { ip: process.env.TPLINK_IP || '192.168.0.1' };
+const SESSION_FILE = (process.env.HOME || '~') + '/.tplink-session';
 const KEY1 = 'RDpbLfCPsJZ7fiv';
 const KEY2 = 'yLwVl0zKqws7LgKPRQ84Mdt708T1qQ3Ha7xv3H7NyU84p21BriUWBU43odz3iP4rBL3cD02KZciXTysVXiV8ngg6vL48rPJyAUw0HurW20xqxv9aYb4M9wK1Ae0wlro510qXeU07kV57fQMc8L6aLgMLwygtc0F10a0Dg70TOoouyFhdysuRMO51yY5ZlOZZLEal1h0t9YQW0Ko7oBwmCAHoic4HYbUyVeU3sfQ1xtXcPcf1aT303wAQhv66qzW';
 
@@ -45,15 +46,47 @@ function securityEncode(input, key1, key2) {
   return result;
 }
 
-async function login(pwd) {
-  const encoded = securityEncode(pwd, KEY1, KEY2);
+// ---- Session cache ----
+function loadSession() {
+  try {
+    const fs = require('fs');
+    if (!fs.existsSync(SESSION_FILE)) return null;
+    return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+  } catch { return null; }
+}
+
+function saveSession(stok, pwd) {
+  const fs = require('fs');
+  fs.writeFileSync(SESSION_FILE, JSON.stringify({ stok, pwd, saved: Date.now() }));
+  try { fs.chmodSync(SESSION_FILE, 0o600); } catch {}
+}
+
+async function getStok(pwd) {
+  // Try cached stok first
+  const sess = loadSession();
+  if (sess?.stok) {
+    const r = await fetch(`http://${CONFIG.ip}/stok=${sess.stok}/ds`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Referer': `http://${CONFIG.ip}/` },
+      body: JSON.stringify({ method: 'get', device_info: { name: 'info' } }),
+    }).then(r => r.json()).catch(() => ({}));
+    if (r.error_code === 0) {
+      console.error(`[using cached session]`);
+      return sess.stok;
+    }
+  }
+  // Full login
+  const thePwd = pwd || sess?.pwd;
+  if (!thePwd) throw new Error('No password. Use -p <password> or set TPLINK_PWD env var.');
+  const encoded = securityEncode(thePwd, KEY1, KEY2);
   const resp = await fetch(`http://${CONFIG.ip}/`, {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'Referer': `http://${CONFIG.ip}/` },
     body: JSON.stringify({ method: 'do', login: { password: encoded } }),
   });
   const data = await resp.json();
   if (data.error_code !== 0) throw new Error(`Login failed: ${JSON.stringify(data)}`);
-  return encodeURIComponent(decodeURIComponent(data.stok));
+  const stok = encodeURIComponent(decodeURIComponent(data.stok));
+  saveSession(stok, thePwd);
+  return stok;
 }
 
 async function api(stok, query) {
@@ -225,12 +258,12 @@ Examples:
 
 async function main() {
   const args = process.argv.slice(2);
-  let pwd = process.env.TPLINK_PWD, i = 0;
+  let pwd, i = 0;
   if (args[0] === '-p') { pwd = args[1]; i = 2; }
+  pwd = pwd || process.env.TPLINK_PWD;
   if (args[0] === '-h' || args[0] === 'help') { console.log(HELP); process.exit(0); }
-  if (!pwd) { console.error('Usage: node tplink.js -p <password> <command>\nSet TPLINK_PWD env var to skip -p.'); process.exit(1); }
 
-  const stok = await login(pwd);
+  const stok = await getStok(pwd);
   const cmd = args[i] || 'status';
   const arg = args[i+1];
 
