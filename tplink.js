@@ -1,287 +1,334 @@
 #!/usr/bin/env node
-// TP-Link EasyMesh Router CLI — for XDR / 易展 series
-// Usage: node tplink.js -p <password> <command> [args...]
-//
-// Commands:
-//   status                    Router info + all devices
-//   wifi                      WiFi settings (channel, bw, power, band steering)
-//   wan                       WAN/LAN connection details
-//   info                      Firmware & hardware version only
-//   channel [5G-channel]      Show or set 5GHz channel (149,153,157,161,165,36-64,auto=0)
-//   power [high|mid|low]      Show or set radio TX power (both bands)
-//   bandwidth [auto|20|40|80] Show or set 5GHz bandwidth
-//   reboot                    Reboot the router
-//   raw '<json>'              Arbitrary API query
-//
-// Examples:
-//   node tplink.js -p mypass status
-//   node tplink.js -p mypass channel 149
-//   node tplink.js -p mypass power high
-//   node tplink.js -p mypass reboot
-//   node tplink.js -p mypass raw '{"device_info":{"name":"info"}}'
+// tplink — TP-Link EasyMesh router CLI (XDR / 易展 series)
+// Usage: tplink <command> [subcommand] [args...]
 
-const CONFIG = { ip: process.env.TPLINK_IP || '192.168.0.1' };
-const SESSION_FILE = (process.env.HOME || '~') + '/.tplink-session';
+const VERSION = '4.0.0';
+const IP = process.env.TPLINK_IP || '192.168.0.1';
+const SESSION_FILE = (process.env.HOME || require('os').homedir()) + '/.tplink-session';
 const KEY1 = 'RDpbLfCPsJZ7fiv';
 const KEY2 = 'yLwVl0zKqws7LgKPRQ84Mdt708T1qQ3Ha7xv3H7NyU84p21BriUWBU43odz3iP4rBL3cD02KZciXTysVXiV8ngg6vL48rPJyAUw0HurW20xqxv9aYb4M9wK1Ae0wlro510qXeU07kV57fQMc8L6aLgMLwygtc0F10a0Dg70TOoouyFhdysuRMO51yY5ZlOZZLEal1h0t9YQW0Ko7oBwmCAHoic4HYbUyVeU3sfQ1xtXcPcf1aT303wAQhv66qzW';
 
-const CH_NAMES = { '0':'Auto','36':'36','40':'40','44':'44','48':'48','52':'52','56':'56','60':'60','64':'64',
+const CH = { '0':'Auto','36':'36','40':'40','44':'44','48':'48','52':'52','56':'56','60':'60','64':'64',
   '149':'149','153':'153','157':'157','161':'161','165':'165' };
-const CH_REVERSE = Object.fromEntries(Object.entries(CH_NAMES).map(([k,v]) => [v,k]));
-const BW_NAMES = { '0': 'Auto', '1': '20MHz', '2': '40MHz', '3': '80MHz' };
-const BW_REVERSE = { 'auto': '0', '20': '1', '40': '2', '80': '3' };
-const POWER_NAMES = { '0': 'High', '1': 'Mid', '2': 'Low' };
-const POWER_REVERSE = { 'high': '0', 'mid': '1', 'low': '2' };
+const BW = { '0':'Auto','1':'20MHz','2':'40MHz','3':'80MHz' };
+const PW = { '0':'High','1':'Mid','2':'Low' };
 
-function securityEncode(input, key1, key2) {
-  let result = '';
-  const maxLen = Math.max(input.length, key1.length);
-  for (let m = 0; m < maxLen; m++) {
+function enc(input, k1, k2) {
+  let r = '', n = Math.max(input.length, k1.length);
+  for (let m = 0; m < n; m++) {
     let k = 187, l = 187;
-    if (m >= input.length) l = key1.charCodeAt(m);
-    else if (m >= key1.length) k = input.charCodeAt(m);
-    else { k = input.charCodeAt(m); l = key1.charCodeAt(m); }
-    result += key2.charAt((k ^ l) % key2.length);
+    m >= input.length ? l = k1.charCodeAt(m) : m >= k1.length ? k = input.charCodeAt(m) : (k = input.charCodeAt(m), l = k1.charCodeAt(m));
+    r += k2.charAt((k ^ l) % k2.length);
   }
-  return result;
+  return r;
 }
 
-// ---- Session cache ----
-function loadSession() {
+// ---- Session ----
+function load() { try { const fs = require('fs'); return fs.existsSync(SESSION_FILE) ? JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8')) : null; } catch { return null; } }
+function save(s) { const fs = require('fs'); fs.writeFileSync(SESSION_FILE, JSON.stringify(s)); try { fs.chmodSync(SESSION_FILE, 0o600); } catch {} }
+function clear() { try { require('fs').unlinkSync(SESSION_FILE); } catch {} }
+
+async function login(pwd) {
+  const e = enc(pwd, KEY1, KEY2);
+  const r = await post('/', { method: 'do', login: { password: e } });
+  if (r.error_code !== 0) throw new Error(`Login failed (code ${r.error_code})`);
+  return encodeURIComponent(decodeURIComponent(r.stok));
+}
+
+async function checkStok(stok) {
   try {
-    const fs = require('fs');
-    if (!fs.existsSync(SESSION_FILE)) return null;
-    return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
-  } catch { return null; }
+    const r = await post(`/stok=${stok}/ds`, { method: 'get', device_info: { name: 'info' } });
+    return r.error_code === 0;
+  } catch { return false; }
 }
 
-function saveSession(stok, pwd) {
-  const fs = require('fs');
-  fs.writeFileSync(SESSION_FILE, JSON.stringify({ stok, pwd, saved: Date.now() }));
-  try { fs.chmodSync(SESSION_FILE, 0o600); } catch {}
-}
-
-async function getStok(pwd) {
-  // Try cached stok first
-  const sess = loadSession();
-  if (sess?.stok) {
-    const r = await fetch(`http://${CONFIG.ip}/stok=${sess.stok}/ds`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'Referer': `http://${CONFIG.ip}/` },
-      body: JSON.stringify({ method: 'get', device_info: { name: 'info' } }),
-    }).then(r => r.json()).catch(() => ({}));
-    if (r.error_code === 0) {
-      console.error(`[using cached session]`);
-      return sess.stok;
-    }
-  }
-  // Full login
-  const thePwd = pwd || sess?.pwd;
-  if (!thePwd) throw new Error('No password. Use -p <password> or set TPLINK_PWD env var.');
-  const encoded = securityEncode(thePwd, KEY1, KEY2);
-  const resp = await fetch(`http://${CONFIG.ip}/`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'Referer': `http://${CONFIG.ip}/` },
-    body: JSON.stringify({ method: 'do', login: { password: encoded } }),
+async function post(path, body) {
+  const r = await fetch(`http://${IP}${path}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Referer': `http://${IP}/` },
+    body: JSON.stringify(body),
   });
-  const data = await resp.json();
-  if (data.error_code !== 0) throw new Error(`Login failed: ${JSON.stringify(data)}`);
-  const stok = encodeURIComponent(decodeURIComponent(data.stok));
-  saveSession(stok, thePwd);
+  return r.json();
+}
+
+async function getStok() {
+  const s = load();
+  if (!s?.stok) throw new Error('Not logged in. Run: tplink login -p <password>');
+  if (await checkStok(s.stok)) return s.stok;
+  if (!s.pwd) throw new Error('Session expired and no saved password. Run: tplink login -p <password>');
+  const stok = await login(s.pwd);
+  save({ stok, pwd: s.pwd });
   return stok;
 }
 
-async function api(stok, query) {
-  const url = `http://${CONFIG.ip}/stok=${stok}/ds`;
-  const resp = await fetch(url, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'Referer': `http://${CONFIG.ip}/` },
-    body: JSON.stringify(query),
-  });
-  return resp.json();
+async function reauth(s, pwd) {
+  const stok = await login(pwd);
+  save({ stok, pwd });
+  return stok;
 }
 
-async function getWireless(stok) {
-  const r = await api(stok, { method: 'get', wireless: { name: ['wlan_host_2g', 'wlan_host_5g', 'wlan_bs'] } });
-  return r.wireless || {};
+// ---- Commands ----
+async function cmdLogin(pwd) {
+  if (!pwd) {
+    try { pwd = require('readline').createInterface({ input: process.stdin, output: process.stderr }).question('Password: '); } catch {}
+    if (!pwd) throw new Error('Password required. Use: tplink login -p <password>');
+  }
+  const stok = await login(pwd);
+  save({ stok, pwd });
+  const r = await post(`/stok=${stok}/ds`, { method: 'get', device_info: { name: 'info' } });
+  const i = r.device_info?.info || {};
+  console.log(`Logged in to ${i.device_model || IP}`);
+  console.log(`Firmware: ${i.sw_version || '?'}`);
+}
+
+function cmdLogout() {
+  clear();
+  console.log('Logged out.');
 }
 
 async function cmdStatus(stok) {
   const [r, w] = await Promise.all([
-    api(stok, { method: 'get', device_info: { name: 'info' }, hosts_info: { table: 'host_info' },
+    post(`/stok=${stok}/ds`, { method: 'get', device_info: { name: 'info' }, hosts_info: { table: 'host_info' },
       network: { name: ['wan_status', 'lan'] }, function: { name: 'new_module_spec' } }),
-    getWireless(stok),
+    post(`/stok=${stok}/ds`, { method: 'get', wireless: { name: ['wlan_host_2g', 'wlan_host_5g', 'wlan_bs'] } }),
   ]);
-  const info = r.device_info?.info || {};
+  const wi = r.device_info?.info || {};
   const wan = r.network?.wan_status || {};
   const lan = r.network?.lan || {};
-  const spec = r.function?.new_module_spec || {};
-  const h5g = w.wlan_host_5g || {};
-  const h2g = w.wlan_host_2g || {};
+  const sp = r.function?.new_module_spec || {};
+  const h5 = w.wireless?.wlan_host_5g || {};
+  const h2 = w.wireless?.wlan_host_2g || {};
 
   const hi = r.hosts_info?.host_info || [];
   const hosts = hi.length === 1 && Object.keys(hi[0]).length > 1
     ? Object.values(hi[0]).map(h => Object.values(h)[0])
     : hi.map(h => Object.values(h)[0]);
 
-  console.log(`=== Router ===`);
-  console.log(`  Model:        ${info.device_model || '?'}`);
-  console.log(`  Firmware:     ${info.sw_version || '?'}`);
-  console.log(`  WAN IP:       ${wan.ipaddr || '?'} (${wan.proto || '?'})`);
-  console.log(`  Gateway:      ${wan.gateway || '?'}`);
-  console.log(`  WAN Link:     ${wan.link_status === 1 ? 'UP' : 'DOWN'}`);
-  console.log(`  LAN:          ${lan.ipaddr || '?'} / ${lan.macaddr || '?'}`);
-  console.log(`  Band Steering: ${spec.wifison === '1' ? 'ON' : 'OFF'} | HW NAT: ${spec.hnat === '1' ? 'ON' : 'OFF'}`);
-  console.log(`  5GHz:         CH ${CH_NAMES[h5g.channel] || h5g.channel} @ ${BW_NAMES[h5g.bandwidth] || h5g.bandwidth} | Power: ${POWER_NAMES[h5g.power] || h5g.power}`);
-  console.log(`  2.4GHz:       CH ${CH_NAMES[h2g.channel] || h2g.channel} @ ${BW_NAMES[h2g.bandwidth] || h2g.bandwidth} | Power: ${POWER_NAMES[h2g.power] || h2g.power}`);
+  console.log(wi.device_model || 'TP-Link Router');
+  console.log(`  Firmware  ${wi.sw_version || '?'} (HW ${wi.hw_version || '?'})`);
+  console.log(`  WAN       ${wan.proto || '?'}  ${wan.ipaddr || '?'}  →  gw ${wan.gateway || '?'}`);
+  console.log(`  LAN       ${lan.ipaddr || '?'} / ${lan.macaddr || '?'}`);
+  console.log(`  WiFi      CH 5G:${CH[h5.channel]||'?'}  BW:${BW[h5.bandwidth]||'?'}  Power:${PW[h5.power]||'?'}  │  CH 2G:${CH[h2.channel]||'?'}  BW:${BW[h2.bandwidth]||'?'}  Power:${PW[h2.power]||'?'}`);
+  console.log(`  Features  BandSteering:${sp.wifison==='1'?'ON':'OFF'}  HWNAT:${sp.hnat==='1'?'ON':'OFF'}`);
 
-  const eth = hosts.filter(h => h.type === '0').length;
-  const g5 = hosts.filter(h => h.type !== '0' && h.wifi_mode === '1').length;
-  const g2 = hosts.filter(h => h.type !== '0' && h.wifi_mode === '0').length;
-  console.log(`  Devices:      ${hosts.length} total (${eth} ETH + ${g5} 5G + ${g2} 2.4G)`);
-
-  console.log(`\n=== Devices (${hosts.length}) ===`);
-  for (const h of hosts.sort((a, b) => (a.wifi_mode || '').localeCompare(b.wifi_mode || ''))) {
-    const band = h.type === '0' ? 'ETH' : (h.wifi_mode === '0' ? '2.4G' : h.wifi_mode === '1' ? '5G' : '?');
-    const name = decodeURIComponent((h.hostname || '').replace(/\+/g, ' ')) || '(unnamed)';
-    const dn = h.down_speed !== '0' ? ` ↓${h.down_speed}kB/s` : '';
-    const up = h.up_speed !== '0' ? ` ↑${h.up_speed}kB/s` : '';
-    console.log(`  ${name.padEnd(35)} ${band.padEnd(4)} ${(h.ip || '-').padEnd(16)} ${h.mac}${dn}${up}`);
+  console.log(`\n  Devices (${hosts.length})`);
+  for (const h of hosts.sort((a, b) => (a.wifi_mode||'').localeCompare(b.wifi_mode||''))) {
+    const t = h.type === '0' ? 'ETH' : h.wifi_mode === '0' ? '2.4G' : h.wifi_mode === '1' ? '5G ' : '?';
+    const n = decodeURIComponent((h.hostname||'').replace(/\+/g,' ')) || '(unnamed)';
+    const s = h.down_speed !== '0' ? ` ↓${h.down_speed}KB/s` : '';
+    console.log(`  ${t}  ${n.padEnd(35)} ${(h.ip||'-').padEnd(16)} ${h.mac}${s}`);
   }
 }
 
-async function cmdWifi(stok) {
-  const w = await getWireless(stok);
-  const h2g = w.wlan_host_2g || {};
-  const h5g = w.wlan_host_5g || {};
-  const bs = w.wlan_bs || {};
-
-  console.log('=== WiFi ===');
-  console.log(`  Band Steering: ${bs.wifi_enable === '1' && bs.bs_enable === '1' ? 'ON' : 'OFF'}  SSID: ${bs.ssid || '(none)'}`);
-  console.log(`  Auth: ${bs.encryption === '1' ? 'WPA2' : bs.encryption === '2' ? 'WPA3' : 'Open'} / ${bs.cipher === '1' ? 'AES' : 'TKIP'}`);
-  console.log(`\n  5GHz │ CH ${CH_NAMES[h5g.channel] || h5g.channel} │ ${BW_NAMES[h5g.bandwidth] || h5g.bandwidth} │ Power ${POWER_NAMES[h5g.power] || h5g.power} │ OFDMA ${h5g.ofdma === '1' ? '✓' : '✗'}`);
-  console.log(`  2.4G │ CH ${CH_NAMES[h2g.channel] || h2g.channel} │ ${BW_NAMES[h2g.bandwidth] || h2g.bandwidth} │ Power ${POWER_NAMES[h2g.power] || h2g.power} │ OFDMA ${h2g.ofdma === '1' ? '✓' : '✗'}`);
+async function cmdDevices(stok) {
+  const r = await post(`/stok=${stok}/ds`, { method: 'get', hosts_info: { table: 'host_info' } });
+  const hi = r.hosts_info?.host_info || [];
+  const hosts = hi.length === 1 && Object.keys(hi[0]).length > 1
+    ? Object.values(hi[0]).map(h => Object.values(h)[0])
+    : hi.map(h => Object.values(h)[0]);
+  for (const h of hosts.sort((a,b) => (a.wifi_mode||'').localeCompare(b.wifi_mode||''))) {
+    const t = h.type === '0' ? 'ETH' : h.wifi_mode === '0' ? '2.4G' : h.wifi_mode === '1' ? '5G ' : '?';
+    const n = decodeURIComponent((h.hostname||'').replace(/\+/g,' ')) || '(unnamed)';
+    console.log(`${t}  ${n}  ${h.ip||'-'}  ${h.mac}`);
+  }
 }
 
-async function cmdInfo(stok) {
-  const r = await api(stok, { method: 'get', device_info: { name: 'info' } });
-  const i = r.device_info?.info || {};
-  console.log(`Model:    ${i.device_model || '?'}`);
-  console.log(`Firmware: ${i.sw_version || '?'}`);
-  console.log(`HW:       ${i.hw_version || '?'}`);
+async function cmdWifiShow(stok) {
+  const w = await post(`/stok=${stok}/ds`, { method: 'get', wireless: { name: ['wlan_host_2g', 'wlan_host_5g', 'wlan_bs'] } });
+  const h2 = w.wireless?.wlan_host_2g || {};
+  const h5 = w.wireless?.wlan_host_5g || {};
+  const bs = w.wireless?.wlan_bs || {};
+  console.log(`SSID: ${bs.ssid || '?'}  BandSteering: ${bs.bs_enable==='1'?'ON':'OFF'}  Auth: ${bs.encryption==='1'?'WPA2':bs.encryption==='2'?'WPA3':'Open'}`);
+  console.log(`5GHz  │ CH ${CH[h5.channel]||'?'} │ ${BW[h5.bandwidth]||'?'} │ Power ${PW[h5.power]||'?'} │ OFDMA ${h5.ofdma==='1'?'✓':'✗'} │ Mode ${h5.mode==='10'?'ax':h5.mode}`);
+  console.log(`2.4G │ CH ${CH[h2.channel]||'?'} │ ${BW[h2.bandwidth]||'?'} │ Power ${PW[h2.power]||'?'} │ OFDMA ${h2.ofdma==='1'?'✓':'✗'} │ Mode ${h2.mode==='9'?'ax':h2.mode}`);
+}
+
+async function cmdWifiSet(stok, key, val) {
+  const rev = { channel: { map: Object.fromEntries(Object.entries(CH).map(([k,v])=>[v.toLowerCase(),k])), name:'Channel', mod:'wlan_host_5g', field:'channel' },
+    power: { map: { high:'0', mid:'1', low:'2' }, name:'Power', mod:'wlan_host_5g', field:'power',
+      mod2:'wlan_host_2g', field2:'power' },
+    bandwidth: { map: { auto:'0', 20:'1', 40:'2', 80:'3' }, name:'Bandwidth', mod:'wlan_host_5g', field:'bandwidth' } };
+  const def = rev[key];
+  if (!def) throw new Error(`Unknown wifi setting: ${key}. Use: channel, power, bandwidth`);
+  const v = def.map[String(val).toLowerCase()];
+  if (v == null) throw new Error(`Invalid ${key}: ${val}. Options: ${Object.keys(def.map).join(', ')}`);
+  const o = {};
+  o[def.mod] = { [def.field]: v };
+  if (def.mod2) o[def.mod2] = { [def.field2]: v };
+  const r = await post(`/stok=${stok}/ds`, { method: 'set', wireless: o });
+  if (r.error_code === 0) {
+    const label = { channel: CH[v]||v, power: PW[v]||v, bandwidth: BW[v]||v }[key];
+    console.log(`${def.name} set to ${label}`);
+  } else {
+    throw new Error(`Failed: ${JSON.stringify(r)}`);
+  }
 }
 
 async function cmdWan(stok) {
-  const r = await api(stok, { method: 'get', network: { name: ['wan_status', 'lan'] } });
-  const wan = r.network?.wan_status || {};
-  const lan = r.network?.lan || {};
-  console.log(`=== WAN ===`);
-  console.log(`  Protocol: ${wan.proto || '?'}  IP: ${wan.ipaddr || '?'}`);
-  console.log(`  Gateway:  ${wan.gateway || '?'}  DNS: ${wan.pri_dns || '?'}`);
-  console.log(`  Link:     ${wan.link_status === 1 ? 'UP ✅' : 'DOWN ❌'}  PHY: ${wan.phy_status === 1 ? 'Connected' : 'Disconnected'}`);
-  console.log(`  Uptime:   ${Math.floor((wan.up_time||0)/3600)}h ${Math.floor(((wan.up_time||0)%3600)/60)}m`);
-  console.log(`=== LAN ===`);
-  console.log(`  IP: ${lan.ipaddr || '?'}  Netmask: ${lan.netmask || '?'}  MAC: ${lan.macaddr || '?'}`);
-}
-
-async function cmdChannel(stok, val) {
-  const w = await getWireless(stok);
-  const h5g = w.wlan_host_5g || {};
-  if (!val) {
-    console.log(`5G Channel: ${CH_NAMES[h5g.channel] || h5g.channel}`);
-    console.log(`Available: ${Object.values(CH_NAMES).join(', ')}`);
-    return;
-  }
-  const ch = val === 'auto' ? '0' : (CH_REVERSE[val] || val);
-  if (!CH_NAMES[ch]) { console.error(`Invalid channel: ${val}. Use: ${Object.values(CH_NAMES).join(', ')}`); process.exit(1); }
-  const r = await api(stok, { method: 'set', wireless: { wlan_host_5g: { channel: ch } } });
-  if (r.error_code === 0) console.log(`5G Channel set to ${CH_NAMES[ch]}`);
-  else console.log(`FAIL: ${JSON.stringify(r)}`);
-}
-
-async function cmdPower(stok, val) {
-  const w = await getWireless(stok);
-  const h5g = w.wlan_host_5g || {}, h2g = w.wlan_host_2g || {};
-  if (!val) {
-    console.log(`2.4G Power: ${POWER_NAMES[h2g.power] || h2g.power}`);
-    console.log(`5G   Power: ${POWER_NAMES[h5g.power] || h5g.power}`);
-    return;
-  }
-  const p = POWER_REVERSE[val.toLowerCase()];
-  if (!p) { console.error(`Invalid: ${val}. Use: high, mid, low`); process.exit(1); }
-  const r = await api(stok, { method: 'set', wireless: { wlan_host_2g: { power: p }, wlan_host_5g: { power: p } } });
-  if (r.error_code === 0) console.log(`TX Power set to ${POWER_NAMES[p]} (both bands)`);
-  else console.log(`FAIL: ${JSON.stringify(r)}`);
-}
-
-async function cmdBandwidth(stok, val) {
-  const w = await getWireless(stok);
-  const h5g = w.wlan_host_5g || {}, h2g = w.wlan_host_2g || {};
-  if (!val) {
-    console.log(`2.4G Bandwidth: ${BW_NAMES[h2g.bandwidth] || h2g.bandwidth}`);
-    console.log(`5G   Bandwidth: ${BW_NAMES[h5g.bandwidth] || h5g.bandwidth}`);
-    return;
-  }
-  const bw = BW_REVERSE[val.toLowerCase()];
-  if (!bw) { console.error(`Invalid: ${val}. Use: auto, 20, 40, 80`); process.exit(1); }
-  const r = await api(stok, { method: 'set', wireless: { wlan_host_5g: { bandwidth: bw } } });
-  if (r.error_code === 0) console.log(`5G Bandwidth set to ${BW_NAMES[bw]}`);
-  else console.log(`FAIL: ${JSON.stringify(r)}`);
+  const r = await post(`/stok=${stok}/ds`, { method: 'get', network: { name: ['wan_status', 'lan'] } });
+  const w = r.network?.wan_status || {};
+  const l = r.network?.lan || {};
+  console.log(`WAN  ${w.proto||'?'}  ${w.ipaddr||'?'}  gw ${w.gateway||'?'}  dns ${w.pri_dns||'?'}`);
+  console.log(`     Link ${w.link_status==1?'UP':'DOWN'}  PHY ${w.phy_status==1?'Connected':'Disconnected'}  Uptime ${Math.floor((w.up_time||0)/3600)}h`);
+  console.log(`LAN  ${l.ipaddr||'?'}/${l.netmask||'?'}  MAC ${l.macaddr||'?'}`);
 }
 
 async function cmdReboot(stok) {
-  console.log('Rebooting...');
-  const r = await api(stok, { method: 'do', system: { reboot: null } });
-  if (r.error_code === 0) console.log('OK: router is restarting.');
-  else console.log(`FAIL: ${JSON.stringify(r)}`);
+  const r = await post(`/stok=${stok}/ds`, { method: 'do', system: { reboot: null } });
+  if (r.error_code === 0) console.log('Rebooting...');
+  else throw new Error(`Reboot failed: ${JSON.stringify(r)}`);
 }
 
-const HELP = `TP-Link CLI v3 — for XDR / 易展 series
+async function cmdApi(stok, json) {
+  try {
+    const body = JSON.parse(json);
+    const r = await post(`/stok=${stok}/ds`, body);
+    console.log(JSON.stringify(r, null, 2));
+  } catch (e) {
+    if (e instanceof SyntaxError) throw new Error('Invalid JSON. Example: tplink api \'{"device_info":{"name":"info"}}\'');
+    throw e;
+  }
+}
 
-Usage: node tplink.js -p <password> <command> [args...]
+function showHelp(cmd) {
+  if (cmd === 'login') { console.log(`tplink login -p <password>
 
-Commands:
-  status                    Router summary + all devices with realtime speed
-  wifi                      WiFi radio settings (channel, bw, power)
-  wan                       WAN/LAN connection details
-  info                      Firmware & hardware version
-  channel [num|auto]        Show or set 5GHz channel
-  power [high|mid|low]       Show or set TX power (both bands)
-  bandwidth [auto|20|40|80]  Show or set 5GHz bandwidth
-  reboot                    Reboot the router
-  raw '<json>'              Arbitrary API query
+  Log in to the router and save credentials.
+  After login, other commands work without re-entering password.`); }
+  else if (cmd === 'logout') { console.log(`tplink logout
 
-Examples:
-  TPLINK_PWD=mypass node tplink.js status         # env var, no -p needed
-  node tplink.js -p mypass wifi
-  node tplink.js -p mypass channel 149            # switch to channel 149
-  node tplink.js -p mypass power high             # max TX power
-  node tplink.js -p mypass reboot                 # restart router
-`;
+  Clear saved credentials.`); }
+  else if (cmd === 'status') { console.log(`tplink status
+
+  Show router summary: model, firmware, WAN/LAN, WiFi settings,
+  and all connected devices with real-time speed.`); }
+  else if (cmd === 'devices') { console.log(`tplink devices
+
+  List all connected devices (ETH / 5G / 2.4G).`); }
+  else if (cmd === 'wifi') { console.log(`tplink wifi show
+  tplink wifi set channel <149|153|157|161|165|36|40|44|48|auto>
+  tplink wifi set power <high|mid|low>
+  tplink wifi set bandwidth <auto|20|40|80>
+
+  Show or configure WiFi radio settings.
+  5GHz channels available: 36,40,44,48,52,56,60,64,149,153,157,161,165 (Auto)
+  Setting power or bandwidth affects BOTH 2.4GHz and 5GHz radios.`); }
+  else if (cmd === 'wan') { console.log(`tplink wan
+
+  Show WAN (internet) connection status and LAN address.`); }
+  else if (cmd === 'reboot') { console.log(`tplink reboot
+
+  Reboot the router.`); }
+  else if (cmd === 'api') { console.log(`tplink api '<json>'
+
+  Send a raw API request. The JSON body is sent as-is.
+
+  Known modules: device_info, hosts_info, network, wireless, function
+
+  Example:
+    tplink api '{"method":"get","device_info":{"name":"info"}}'
+    tplink api '{"method":"get","wireless":{"name":["wlan_host_5g"]}}'`); }
+  else {
+    console.log(`tplink — TP-Link EasyMesh router CLI  v${VERSION}
+
+USAGE
+  tplink <command> [args...]
+
+AUTH
+  tplink login -p <password>     Log in and save credentials
+  tplink logout                  Clear saved credentials
+
+READ
+  tplink status                  Router summary + all devices
+  tplink devices                 List all connected devices
+  tplink wifi show               WiFi radio settings
+  tplink wan                     WAN/LAN connection details
+
+WRITE
+  tplink wifi set channel <ch>   Set 5GHz channel
+  tplink wifi set power <p>      Set TX power (high|mid|low)
+  tplink wifi set bandwidth <bw> Set 5GHz bandwidth (auto|20|40|80)
+  tplink reboot                  Reboot the router
+
+ADVANCED
+  tplink api '<json>'            Raw API request
+
+FLAGS
+  -p, --password <pwd>           Password (only for login)
+  --help, help [cmd]             Show help (optionally for a command)
+  --version                      Show version
+
+ENV
+  TPLINK_IP                      Router IP (default: 192.168.0.1)
+
+EXAMPLES
+  tplink login -p mypassword
+  tplink status
+  tplink wifi show
+  tplink wifi set channel 149
+  tplink reboot
+  tplink api '{"device_info":{"name":"info"}}'
+`);
+  }
+}
 
 async function main() {
   const args = process.argv.slice(2);
-  let pwd, i = 0;
-  if (args[0] === '-p') { pwd = args[1]; i = 2; }
-  pwd = pwd || process.env.TPLINK_PWD;
-  if (args[0] === '-h' || args[0] === 'help') { console.log(HELP); process.exit(0); }
+  const flags = { help: false, version: false, cmdHelp: null, pwd: null };
+  const pos = [];
 
-  const stok = await getStok(pwd);
-  const cmd = args[i] || 'status';
-  const arg = args[i+1];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--help' || args[i] === '-h') { flags.help = true; continue; }
+    if (args[i] === '--version') { flags.version = true; continue; }
+    if (args[i] === '-p' || args[i] === '--password') { flags.pwd = args[++i]; continue; }
+    if (args[i] === 'help') { flags.help = true; flags.cmdHelp = args[i+1]; i++; continue; }
+    pos.push(args[i]);
+  }
 
-  switch (cmd) {
-    case 'status': case 'devices': await cmdStatus(stok); break;
-    case 'wifi': await cmdWifi(stok); break;
-    case 'wan': await cmdWan(stok); break;
-    case 'info': await cmdInfo(stok); break;
-    case 'channel': await cmdChannel(stok, arg); break;
-    case 'power': await cmdPower(stok, arg); break;
-    case 'bandwidth': await cmdBandwidth(stok, arg); break;
-    case 'reboot': await cmdReboot(stok); break;
-    case 'raw': {
-      const r = await api(stok, JSON.parse(args[i+1] || '{"device_info":{"name":"info"}}'));
-      console.log(JSON.stringify(r, null, 2));
-      break;
+  if (flags.version) { console.log(`tplink v${VERSION}`); process.exit(0); }
+  if (flags.help) { showHelp(flags.cmdHelp || ''); process.exit(0); }
+
+  const cmd = pos[0];
+
+  // login/logout don't need existing session
+  if (cmd === 'login') {
+    await cmdLogin(flags.pwd);
+    process.exit(0);
+  }
+  if (cmd === 'logout') { cmdLogout(); process.exit(0); }
+
+  // All other commands need auth
+  let stok, session;
+  try {
+    if (flags.pwd) {
+      stok = await reauth(session, flags.pwd);
+    } else {
+      stok = await getStok();
     }
-    default: console.error(`Unknown: ${cmd}. Use -h for help.`); process.exit(1);
+  } catch (e) {
+    console.error(`Error: ${e.message}`);
+    if (!load()) console.error('  Hint: run "tplink login -p <password>" first.');
+    process.exit(1);
+  }
+
+  // Dispatch
+  try {
+    switch (cmd) {
+      case 'status': await cmdStatus(stok); break;
+      case 'devices': await cmdDevices(stok); break;
+      case 'wifi':
+        if (pos[1] === 'show' || !pos[1]) await cmdWifiShow(stok);
+        else if (pos[1] === 'set') await cmdWifiSet(stok, pos[2], pos[3]);
+        else { console.error(`Unknown subcommand: wifi ${pos[1]}. Use: wifi show | wifi set <key> <val>`); process.exit(1); }
+        break;
+      case 'wan': await cmdWan(stok); break;
+      case 'reboot': await cmdReboot(stok); break;
+      case 'api': await cmdApi(stok, pos[1] || ''); break;
+      default: showHelp(''); process.exit(cmd ? 1 : 0);
+    }
+  } catch (e) {
+    console.error(`Error: ${e.message}`);
+    process.exit(1);
   }
 }
-main().catch(e => { console.error('Error:', e.message); process.exit(1); });
+
+main().catch(e => { console.error(e.message); process.exit(1); });
