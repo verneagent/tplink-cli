@@ -1,15 +1,36 @@
 #!/usr/bin/env node
 // TP-Link EasyMesh Router CLI — for XDR / 易展 series
-// Usage: node tplink.js -p <password> [status|wifi|wan|devices|raw <json>]
+// Usage: node tplink.js -p <password> <command> [args...]
+//
+// Commands:
+//   status                    Router info + all devices
+//   wifi                      WiFi settings (channel, bw, power, band steering)
+//   wan                       WAN/LAN connection details
+//   info                      Firmware & hardware version only
+//   channel [5G-channel]      Show or set 5GHz channel (149,153,157,161,165,36-64,auto=0)
+//   power [high|mid|low]      Show or set radio TX power (both bands)
+//   bandwidth [auto|20|40|80] Show or set 5GHz bandwidth
+//   reboot                    Reboot the router
+//   raw '<json>'              Arbitrary API query
+//
+// Examples:
+//   node tplink.js -p mypass status
+//   node tplink.js -p mypass channel 149
+//   node tplink.js -p mypass power high
+//   node tplink.js -p mypass reboot
+//   node tplink.js -p mypass raw '{"device_info":{"name":"info"}}'
 
 const CONFIG = { ip: process.env.TPLINK_IP || '192.168.0.1' };
 const KEY1 = 'RDpbLfCPsJZ7fiv';
 const KEY2 = 'yLwVl0zKqws7LgKPRQ84Mdt708T1qQ3Ha7xv3H7NyU84p21BriUWBU43odz3iP4rBL3cD02KZciXTysVXiV8ngg6vL48rPJyAUw0HurW20xqxv9aYb4M9wK1Ae0wlro510qXeU07kV57fQMc8L6aLgMLwygtc0F10a0Dg70TOoouyFhdysuRMO51yY5ZlOZZLEal1h0t9YQW0Ko7oBwmCAHoic4HYbUyVeU3sfQ1xtXcPcf1aT303wAQhv66qzW';
-const CHANNELS = { '0': 'Auto', '1': '1', '2': '2', '3': '3', '4': '4', '5': '5', '6': '6',
-  '7': '7', '8': '8', '9': '9', '10': '10', '11': '11', '12': '12', '13': '13',
-  '36': '36', '40': '40', '44': '44', '48': '48', '52': '52', '56': '56', '60': '60', '64': '64',
-  '149': '149', '153': '153', '157': '157', '161': '161', '165': '165' };
-const BW = { '0': 'Auto', '1': '20MHz', '2': '40MHz', '3': '80MHz' };
+
+const CH_NAMES = { '0':'Auto','36':'36','40':'40','44':'44','48':'48','52':'52','56':'56','60':'60','64':'64',
+  '149':'149','153':'153','157':'157','161':'161','165':'165' };
+const CH_REVERSE = Object.fromEntries(Object.entries(CH_NAMES).map(([k,v]) => [v,k]));
+const BW_NAMES = { '0': 'Auto', '1': '20MHz', '2': '40MHz', '3': '80MHz' };
+const BW_REVERSE = { 'auto': '0', '20': '1', '40': '2', '80': '3' };
+const POWER_NAMES = { '0': 'High', '1': 'Mid', '2': 'Low' };
+const POWER_REVERSE = { 'high': '0', 'mid': '1', 'low': '2' };
 
 function securityEncode(input, key1, key2) {
   let result = '';
@@ -44,130 +65,190 @@ async function api(stok, query) {
   return resp.json();
 }
 
-async function cmdStatus(stok) {
-  const r = await api(stok, { method: 'get',
-    device_info: { name: 'info' },
-    hosts_info: { table: 'host_info' },
-    network: { name: ['wan_status', 'lan'] },
-    function: { name: 'new_module_spec' },
-  });
+async function getWireless(stok) {
+  const r = await api(stok, { method: 'get', wireless: { name: ['wlan_host_2g', 'wlan_host_5g', 'wlan_bs'] } });
+  return r.wireless || {};
+}
 
+async function cmdStatus(stok) {
+  const [r, w] = await Promise.all([
+    api(stok, { method: 'get', device_info: { name: 'info' }, hosts_info: { table: 'host_info' },
+      network: { name: ['wan_status', 'lan'] }, function: { name: 'new_module_spec' } }),
+    getWireless(stok),
+  ]);
   const info = r.device_info?.info || {};
-  const spec = r.function?.new_module_spec || {};
   const wan = r.network?.wan_status || {};
   const lan = r.network?.lan || {};
+  const spec = r.function?.new_module_spec || {};
+  const h5g = w.wlan_host_5g || {};
+  const h2g = w.wlan_host_2g || {};
 
-  // Devices — host_info is either [{all_devices}] or [{dev1},{dev2}...]
   const hi = r.hosts_info?.host_info || [];
   const hosts = hi.length === 1 && Object.keys(hi[0]).length > 1
     ? Object.values(hi[0]).map(h => Object.values(h)[0])
     : hi.map(h => Object.values(h)[0]);
 
-  console.log('=== Router ===');
-  console.log(`  Model:    ${info.device_model || '?'}`);
-  console.log(`  Firmware: ${info.sw_version || '?'}`);
-  console.log(`  HW:       ${info.hw_version || '?'}`);
-  console.log(`  WAN IP:   ${wan.ipaddr || '?'} (${wan.proto || '?'})`);
-  console.log(`  Gateway:  ${wan.gateway || '?'}`);
-  console.log(`  WAN Link: ${wan.link_status === 1 ? 'UP' : 'DOWN'} (${wan.phy_status === 1 ? 'connected' : 'disconnected'})`);
-  console.log(`  LAN IP:   ${lan.ipaddr || '?'}`);
-  console.log(`  Band Steering: ${spec.wifison === '1' ? 'ON' : 'OFF'}`);
-  console.log(`  HW NAT:   ${spec.hnat === '1' ? 'enabled' : 'disabled'}`);
+  console.log(`=== Router ===`);
+  console.log(`  Model:        ${info.device_model || '?'}`);
+  console.log(`  Firmware:     ${info.sw_version || '?'}`);
+  console.log(`  WAN IP:       ${wan.ipaddr || '?'} (${wan.proto || '?'})`);
+  console.log(`  Gateway:      ${wan.gateway || '?'}`);
+  console.log(`  WAN Link:     ${wan.link_status === 1 ? 'UP' : 'DOWN'}`);
+  console.log(`  LAN:          ${lan.ipaddr || '?'} / ${lan.macaddr || '?'}`);
+  console.log(`  Band Steering: ${spec.wifison === '1' ? 'ON' : 'OFF'} | HW NAT: ${spec.hnat === '1' ? 'ON' : 'OFF'}`);
+  console.log(`  5GHz:         CH ${CH_NAMES[h5g.channel] || h5g.channel} @ ${BW_NAMES[h5g.bandwidth] || h5g.bandwidth} | Power: ${POWER_NAMES[h5g.power] || h5g.power}`);
+  console.log(`  2.4GHz:       CH ${CH_NAMES[h2g.channel] || h2g.channel} @ ${BW_NAMES[h2g.bandwidth] || h2g.bandwidth} | Power: ${POWER_NAMES[h2g.power] || h2g.power}`);
+
+  const eth = hosts.filter(h => h.type === '0').length;
+  const g5 = hosts.filter(h => h.type !== '0' && h.wifi_mode === '1').length;
+  const g2 = hosts.filter(h => h.type !== '0' && h.wifi_mode === '0').length;
+  console.log(`  Devices:      ${hosts.length} total (${eth} ETH + ${g5} 5G + ${g2} 2.4G)`);
 
   console.log(`\n=== Devices (${hosts.length}) ===`);
   for (const h of hosts.sort((a, b) => (a.wifi_mode || '').localeCompare(b.wifi_mode || ''))) {
-    // type="0" = ETH, type="1" = WiFi; wifi_mode="0"=2.4G, "1"=5G
     const band = h.type === '0' ? 'ETH' : (h.wifi_mode === '0' ? '2.4G' : h.wifi_mode === '1' ? '5G' : '?');
     const name = decodeURIComponent((h.hostname || '').replace(/\+/g, ' ')) || '(unnamed)';
-    console.log(`  ${name.padEnd(35)} ${band.padEnd(4)} ${(h.ip || '-').padEnd(16)} ${h.mac}`);
+    const dn = h.down_speed !== '0' ? ` ↓${h.down_speed}kB/s` : '';
+    const up = h.up_speed !== '0' ? ` ↑${h.up_speed}kB/s` : '';
+    console.log(`  ${name.padEnd(35)} ${band.padEnd(4)} ${(h.ip || '-').padEnd(16)} ${h.mac}${dn}${up}`);
   }
 }
 
 async function cmdWifi(stok) {
-  const r = await api(stok, { method: 'get',
-    wireless: { name: ['wlan_host_2g', 'wlan_host_5g', 'wlan_bs'] },
-    function: { name: 'new_module_spec' },
-  });
-
-  const h2g = r.wireless?.wlan_host_2g || {};
-  const h5g = r.wireless?.wlan_host_5g || {};
-  const bs = r.wireless?.wlan_bs || {};
-  const spec = r.function?.new_module_spec || {};
+  const w = await getWireless(stok);
+  const h2g = w.wlan_host_2g || {};
+  const h5g = w.wlan_host_5g || {};
+  const bs = w.wlan_bs || {};
 
   console.log('=== WiFi ===');
-  console.log(`  Band Steering (双频合一): ${bs.wifi_enable === '1' && bs.bs_enable === '1' ? 'ON' : 'OFF'}`);
-  console.log(`  SSID:   ${bs.ssid || '(none)'}`);
-  console.log(`  Auth:   ${bs.encryption === '1' ? 'WPA2' : bs.encryption === '2' ? 'WPA3' : 'Open'}`);
-  console.log(`  Cipher: ${bs.cipher === '1' ? 'AES' : 'TKIP/AES'}`);
-  if (spec.wifison_sched_enable === '1')
-    console.log(`  Schedule: ${spec.wifison_sched_tm_begin}-${spec.wifison_sched_tm_end}`);
-  if (spec.wifison_guest_enable === '1')
-    console.log(`  Guest SSID: ${spec.wifison_guest_ssid || '?'}`);
+  console.log(`  Band Steering: ${bs.wifi_enable === '1' && bs.bs_enable === '1' ? 'ON' : 'OFF'}  SSID: ${bs.ssid || '(none)'}`);
+  console.log(`  Auth: ${bs.encryption === '1' ? 'WPA2' : bs.encryption === '2' ? 'WPA3' : 'Open'} / ${bs.cipher === '1' ? 'AES' : 'TKIP'}`);
+  console.log(`\n  5GHz │ CH ${CH_NAMES[h5g.channel] || h5g.channel} │ ${BW_NAMES[h5g.bandwidth] || h5g.bandwidth} │ Power ${POWER_NAMES[h5g.power] || h5g.power} │ OFDMA ${h5g.ofdma === '1' ? '✓' : '✗'}`);
+  console.log(`  2.4G │ CH ${CH_NAMES[h2g.channel] || h2g.channel} │ ${BW_NAMES[h2g.bandwidth] || h2g.bandwidth} │ Power ${POWER_NAMES[h2g.power] || h2g.power} │ OFDMA ${h2g.ofdma === '1' ? '✓' : '✗'}`);
+}
 
-  console.log(`\n  --- 2.4GHz Radio ---`);
-  console.log(`  Enable:  ${h2g.enable === '1' ? 'Yes' : 'No'}`);
-  console.log(`  Channel: ${CHANNELS[h2g.channel] || h2g.channel}`);
-  console.log(`  Bandwidth: ${BW[h2g.bandwidth] || h2g.bandwidth}`);
-  console.log(`  Mode:    ${h2g.mode === '9' ? '802.11b/g/n/ax' : h2g.mode}`);
-  console.log(`  Power:   ${h2g.power === '0' ? 'High' : h2g.power === '1' ? 'Mid' : h2g.power === '2' ? 'Low' : h2g.power}`);
-  console.log(`  OFDMA:   ${h2g.ofdma === '1' ? 'On' : 'Off'}`);
-
-  console.log(`\n  --- 5GHz Radio ---`);
-  console.log(`  Enable:  ${h5g.enable === '1' ? 'Yes' : 'No'}`);
-  console.log(`  Channel: ${CHANNELS[h5g.channel] || h5g.channel}`);
-  console.log(`  Bandwidth: ${BW[h5g.bandwidth] || h5g.bandwidth}`);
-  console.log(`  Mode:    ${h5g.mode === '10' ? '802.11a/n/ac/ax' : h5g.mode}`);
-  console.log(`  Power:   ${h5g.power === '0' ? 'High' : h5g.power === '1' ? 'Mid' : h5g.power === '2' ? 'Low' : h5g.power}`);
-  console.log(`  OFDMA:   ${h5g.ofdma === '1' ? 'On' : 'Off'}`);
+async function cmdInfo(stok) {
+  const r = await api(stok, { method: 'get', device_info: { name: 'info' } });
+  const i = r.device_info?.info || {};
+  console.log(`Model:    ${i.device_model || '?'}`);
+  console.log(`Firmware: ${i.sw_version || '?'}`);
+  console.log(`HW:       ${i.hw_version || '?'}`);
 }
 
 async function cmdWan(stok) {
-  const r = await api(stok, { method: 'get', network: { name: ['wan_status', 'lan', 'internet'] } });
+  const r = await api(stok, { method: 'get', network: { name: ['wan_status', 'lan'] } });
   const wan = r.network?.wan_status || {};
   const lan = r.network?.lan || {};
-  console.log('=== WAN ===');
-  console.log(`  Protocol:    ${wan.proto || '?'}`);
-  console.log(`  IP:          ${wan.ipaddr || '?'}`);
-  console.log(`  Netmask:     ${wan.netmask || '?'}`);
-  console.log(`  Gateway:     ${wan.gateway || '?'}`);
-  console.log(`  DNS:         ${wan.pri_dns || '?'} / ${wan.snd_dns || '?'}`);
-  console.log(`  Link:        ${wan.link_status === 1 ? 'UP' : 'DOWN'}`);
-  console.log(`  PHY:         ${wan.phy_status === 1 ? 'Connected' : 'Disconnected'}`);
-  console.log(`  Uptime:      ${Math.floor((wan.up_time || 0) / 3600)}h ${Math.floor(((wan.up_time || 0) % 3600) / 60)}m`);
-  console.log(`\n=== LAN ===`);
-  console.log(`  IP:          ${lan.ipaddr || '?'}`);
-  console.log(`  Netmask:     ${lan.netmask || '?'}`);
-  console.log(`  MAC:         ${lan.macaddr || '?'}`);
+  console.log(`=== WAN ===`);
+  console.log(`  Protocol: ${wan.proto || '?'}  IP: ${wan.ipaddr || '?'}`);
+  console.log(`  Gateway:  ${wan.gateway || '?'}  DNS: ${wan.pri_dns || '?'}`);
+  console.log(`  Link:     ${wan.link_status === 1 ? 'UP ✅' : 'DOWN ❌'}  PHY: ${wan.phy_status === 1 ? 'Connected' : 'Disconnected'}`);
+  console.log(`  Uptime:   ${Math.floor((wan.up_time||0)/3600)}h ${Math.floor(((wan.up_time||0)%3600)/60)}m`);
+  console.log(`=== LAN ===`);
+  console.log(`  IP: ${lan.ipaddr || '?'}  Netmask: ${lan.netmask || '?'}  MAC: ${lan.macaddr || '?'}`);
 }
 
-async function cmdSet(stok, module, field, value) {
-  const body = { method: 'set', wireless: {} };
-  body.wireless[module] = { [field]: value };
-  const r = await api(stok, body);
-  if (r.error_code === 0) console.log(`OK: set ${module}.${field} = ${value}`);
+async function cmdChannel(stok, val) {
+  const w = await getWireless(stok);
+  const h5g = w.wlan_host_5g || {};
+  if (!val) {
+    console.log(`5G Channel: ${CH_NAMES[h5g.channel] || h5g.channel}`);
+    console.log(`Available: ${Object.values(CH_NAMES).join(', ')}`);
+    return;
+  }
+  const ch = val === 'auto' ? '0' : (CH_REVERSE[val] || val);
+  if (!CH_NAMES[ch]) { console.error(`Invalid channel: ${val}. Use: ${Object.values(CH_NAMES).join(', ')}`); process.exit(1); }
+  const r = await api(stok, { method: 'set', wireless: { wlan_host_5g: { channel: ch } } });
+  if (r.error_code === 0) console.log(`5G Channel set to ${CH_NAMES[ch]}`);
   else console.log(`FAIL: ${JSON.stringify(r)}`);
 }
+
+async function cmdPower(stok, val) {
+  const w = await getWireless(stok);
+  const h5g = w.wlan_host_5g || {}, h2g = w.wlan_host_2g || {};
+  if (!val) {
+    console.log(`2.4G Power: ${POWER_NAMES[h2g.power] || h2g.power}`);
+    console.log(`5G   Power: ${POWER_NAMES[h5g.power] || h5g.power}`);
+    return;
+  }
+  const p = POWER_REVERSE[val.toLowerCase()];
+  if (!p) { console.error(`Invalid: ${val}. Use: high, mid, low`); process.exit(1); }
+  const r = await api(stok, { method: 'set', wireless: { wlan_host_2g: { power: p }, wlan_host_5g: { power: p } } });
+  if (r.error_code === 0) console.log(`TX Power set to ${POWER_NAMES[p]} (both bands)`);
+  else console.log(`FAIL: ${JSON.stringify(r)}`);
+}
+
+async function cmdBandwidth(stok, val) {
+  const w = await getWireless(stok);
+  const h5g = w.wlan_host_5g || {}, h2g = w.wlan_host_2g || {};
+  if (!val) {
+    console.log(`2.4G Bandwidth: ${BW_NAMES[h2g.bandwidth] || h2g.bandwidth}`);
+    console.log(`5G   Bandwidth: ${BW_NAMES[h5g.bandwidth] || h5g.bandwidth}`);
+    return;
+  }
+  const bw = BW_REVERSE[val.toLowerCase()];
+  if (!bw) { console.error(`Invalid: ${val}. Use: auto, 20, 40, 80`); process.exit(1); }
+  const r = await api(stok, { method: 'set', wireless: { wlan_host_5g: { bandwidth: bw } } });
+  if (r.error_code === 0) console.log(`5G Bandwidth set to ${BW_NAMES[bw]}`);
+  else console.log(`FAIL: ${JSON.stringify(r)}`);
+}
+
+async function cmdReboot(stok) {
+  console.log('Rebooting...');
+  const r = await api(stok, { method: 'do', system: { reboot: null } });
+  if (r.error_code === 0) console.log('OK: router is restarting.');
+  else console.log(`FAIL: ${JSON.stringify(r)}`);
+}
+
+const HELP = `TP-Link CLI v3 — for XDR / 易展 series
+
+Usage: node tplink.js -p <password> <command> [args...]
+
+Commands:
+  status                    Router summary + all devices with realtime speed
+  wifi                      WiFi radio settings (channel, bw, power)
+  wan                       WAN/LAN connection details
+  info                      Firmware & hardware version
+  channel [num|auto]        Show or set 5GHz channel
+  power [high|mid|low]       Show or set TX power (both bands)
+  bandwidth [auto|20|40|80]  Show or set 5GHz bandwidth
+  reboot                    Reboot the router
+  raw '<json>'              Arbitrary API query
+
+Examples:
+  TPLINK_PWD=mypass node tplink.js status         # env var, no -p needed
+  node tplink.js -p mypass wifi
+  node tplink.js -p mypass channel 149            # switch to channel 149
+  node tplink.js -p mypass power high             # max TX power
+  node tplink.js -p mypass reboot                 # restart router
+`;
 
 async function main() {
   const args = process.argv.slice(2);
   let pwd = process.env.TPLINK_PWD, i = 0;
   if (args[0] === '-p') { pwd = args[1]; i = 2; }
-  if (!pwd) { console.error('Usage: node tplink.js -p <password> [status|wifi|wan|devices|raw <json>|set <module> <field> <value>]'); process.exit(1); }
+  if (args[0] === '-h' || args[0] === 'help') { console.log(HELP); process.exit(0); }
+  if (!pwd) { console.error('Usage: node tplink.js -p <password> <command>\nSet TPLINK_PWD env var to skip -p.'); process.exit(1); }
 
   const stok = await login(pwd);
   const cmd = args[i] || 'status';
+  const arg = args[i+1];
 
   switch (cmd) {
     case 'status': case 'devices': await cmdStatus(stok); break;
     case 'wifi': await cmdWifi(stok); break;
     case 'wan': await cmdWan(stok); break;
-    case 'set': await cmdSet(stok, args[i+1], args[i+2], args[i+3]); break;
+    case 'info': await cmdInfo(stok); break;
+    case 'channel': await cmdChannel(stok, arg); break;
+    case 'power': await cmdPower(stok, arg); break;
+    case 'bandwidth': await cmdBandwidth(stok, arg); break;
+    case 'reboot': await cmdReboot(stok); break;
     case 'raw': {
       const r = await api(stok, JSON.parse(args[i+1] || '{"device_info":{"name":"info"}}'));
       console.log(JSON.stringify(r, null, 2));
       break;
     }
-    default: console.error(`Unknown: ${cmd}`); process.exit(1);
+    default: console.error(`Unknown: ${cmd}. Use -h for help.`); process.exit(1);
   }
 }
 main().catch(e => { console.error('Error:', e.message); process.exit(1); });
