@@ -5,7 +5,6 @@
 const CONFIG = { ip: process.env.TPLINK_IP || '192.168.0.1' };
 const KEY1 = 'RDpbLfCPsJZ7fiv';
 const KEY2 = 'yLwVl0zKqws7LgKPRQ84Mdt708T1qQ3Ha7xv3H7NyU84p21BriUWBU43odz3iP4rBL3cD02KZciXTysVXiV8ngg6vL48rPJyAUw0HurW20xqxv9aYb4M9wK1Ae0wlro510qXeU07kV57fQMc8L6aLgMLwygtc0F10a0Dg70TOoouyFhdysuRMO51yY5ZlOZZLEal1h0t9YQW0Ko7oBwmCAHoic4HYbUyVeU3sfQ1xtXcPcf1aT303wAQhv66qzW';
-const BAND = { '0': '2.4G', '1': '5G', '2': 'ETH' };
 const CHANNELS = { '0': 'Auto', '1': '1', '2': '2', '3': '3', '4': '4', '5': '5', '6': '6',
   '7': '7', '8': '8', '9': '9', '10': '10', '11': '11', '12': '12', '13': '13',
   '36': '36', '40': '40', '44': '44', '48': '48', '52': '52', '56': '56', '60': '60', '64': '64',
@@ -58,9 +57,11 @@ async function cmdStatus(stok) {
   const wan = r.network?.wan_status || {};
   const lan = r.network?.lan || {};
 
-  // Devices
-  const hi = r.hosts_info?.host_info;
-  const hosts = hi && hi[0] ? Object.values(hi[0]).map(h => Object.values(h)[0]) : [];
+  // Devices — host_info is either [{all_devices}] or [{dev1},{dev2}...]
+  const hi = r.hosts_info?.host_info || [];
+  const hosts = hi.length === 1 && Object.keys(hi[0]).length > 1
+    ? Object.values(hi[0]).map(h => Object.values(h)[0])
+    : hi.map(h => Object.values(h)[0]);
 
   console.log('=== Router ===');
   console.log(`  Model:    ${info.device_model || '?'}`);
@@ -75,7 +76,8 @@ async function cmdStatus(stok) {
 
   console.log(`\n=== Devices (${hosts.length}) ===`);
   for (const h of hosts.sort((a, b) => (a.wifi_mode || '').localeCompare(b.wifi_mode || ''))) {
-    const band = BAND[h.wifi_mode] || '?';
+    // type="0" = ETH, type="1" = WiFi; wifi_mode="0"=2.4G, "1"=5G
+    const band = h.type === '0' ? 'ETH' : (h.wifi_mode === '0' ? '2.4G' : h.wifi_mode === '1' ? '5G' : '?');
     const name = decodeURIComponent((h.hostname || '').replace(/\+/g, ' ')) || '(unnamed)';
     console.log(`  ${name.padEnd(35)} ${band.padEnd(4)} ${(h.ip || '-').padEnd(16)} ${h.mac}`);
   }
