@@ -174,6 +174,73 @@ async function cmdWan(stok) {
   console.log(`LAN  ${l.ipaddr||'?'}/${l.netmask||'?'}  MAC ${l.macaddr||'?'}`);
 }
 
+async function cmdTopology(stok) {
+  const [r, w] = await Promise.all([
+    post(`/stok=${stok}/ds`, { method: 'get', device_info: { name: 'info' }, hosts_info: { table: 'host_info' },
+      network: { name: ['wan_status', 'lan'] }, function: { name: 'new_module_spec' } }),
+    post(`/stok=${stok}/ds`, { method: 'get', wireless: { name: ['wlan_host_2g', 'wlan_host_5g', 'wlan_bs'] } }),
+  ]);
+  const wi = r.device_info?.info || {};
+  const wan = r.network?.wan_status || {};
+  const lan = r.network?.lan || {};
+  const sp = r.function?.new_module_spec || {};
+  const h5 = w.wireless?.wlan_host_5g || {};
+  const h2 = w.wireless?.wlan_host_2g || {};
+  const bs = w.wireless?.wlan_bs || {};
+
+  const hi = r.hosts_info?.host_info || [];
+  const hosts = hi.length === 1 && Object.keys(hi[0]).length > 1
+    ? Object.values(hi[0]).map(h => Object.values(h)[0])
+    : hi.map(h => Object.values(h)[0]);
+
+  const eth = hosts.filter(h => h.type === '0');
+  const g5 = hosts.filter(h => h.type !== '0' && h.wifi_mode === '1');
+  const g2 = hosts.filter(h => h.type !== '0' && h.wifi_mode === '0');
+
+  console.log(`\n  Internet`);
+  console.log(`  ────────`);
+  console.log(`  │  ${wan.proto || '?'}  ${wan.ipaddr || '?'}`);
+  console.log(`  │  WAN Link: ${wan.link_status==1?'UP':'DOWN'}  Uptime: ${Math.floor((wan.up_time||0)/3600)}h`);
+  console.log(`  │`);
+  console.log(`  ONT (${wan.gateway || '?'})`);
+  console.log(`  │  [gigabit Ethernet]`);
+  console.log(`  │`);
+  console.log(`  ${wi.device_model || 'TP-Link'}  (${lan.ipaddr || '?'})`);
+  console.log(`  ├── FW: ${wi.sw_version || '?'}`);
+  console.log(`  ├── 5GHz CH ${CH[h5.channel]||'?'} @ ${BW[h5.bandwidth]||'?'}  Power: ${PW[h5.power]||'?'}`);
+  console.log(`  ├── 2.4G CH ${CH[h2.channel]||'?'} @ ${BW[h2.bandwidth]||'?'}  Power: ${PW[h2.power]||'?'}`);
+  console.log(`  ├── SSID: ${bs.ssid || '?'}  (${bs.encryption==='1'?'WPA2':bs.encryption==='2'?'WPA3':'Open'})`);
+  console.log(`  ├── Band Steering: ${sp.wifison==='1'?'ON':'OFF'}  HW NAT: ${sp.hnat==='1'?'ON':'OFF'}`);
+  console.log(`  │`);
+  console.log(`  ├── Mesh Node (C81F)  [gigabit wired backhaul]`);
+  console.log(`  │   ├── MAC: 3c-06-a7-5d-c8-1f`);
+  console.log(`  │   └── 5GHz CH same  @ 80MHz`);
+
+  if (eth.length > 0) {
+    console.log(`  │`);
+    console.log(`  ├── Wired (${eth.length})`);
+    for (const h of eth) {
+      const n = decodeURIComponent((h.hostname||'').replace(/\+/g,' ')) || '(unnamed)';
+      console.log(`  │   └── ${n}  ${h.ip||'-'}  ${h.mac}`);
+    }
+  }
+
+  console.log(`  │`);
+  console.log(`  ├── 5GHz WiFi (${g5.length})`);
+  for (const h of g5) {
+    const n = decodeURIComponent((h.hostname||'').replace(/\+/g,' ')) || '(unnamed)';
+    const s = h.down_speed !== '0' ? ` ↓${h.down_speed}KB/s` : '';
+    console.log(`  │   ├── ${n}  ${h.ip||'-'}  ${h.mac}${s}`);
+  }
+
+  console.log(`  │`);
+  console.log(`  └── 2.4GHz WiFi (${g2.length})`);
+  for (const h of g2) {
+    const n = decodeURIComponent((h.hostname||'').replace(/\+/g,' ')) || '(unnamed)';
+    console.log(`      ├── ${n}  ${h.ip||'-'}  ${h.mac}`);
+  }
+}
+
 async function cmdReboot(stok) {
   const r = await post(`/stok=${stok}/ds`, { method: 'do', system: { reboot: null } });
   if (r.error_code === 0) console.log('Rebooting...');
@@ -241,6 +308,7 @@ AUTH
 
 READ
   tplink status                  Router summary + all devices
+  tplink topology                Network tree (ONT → routers → devices)
   tplink devices                 List all connected devices
   tplink wifi show               WiFi radio settings
   tplink wan                     WAN/LAN connection details
@@ -323,6 +391,7 @@ async function main() {
         else { console.error(`Unknown subcommand: wifi ${pos[1]}. Use: wifi show | wifi set <key> <val>`); process.exit(1); }
         break;
       case 'wan': await cmdWan(stok); break;
+      case 'topology': await cmdTopology(stok); break;
       case 'reboot': await cmdReboot(stok); break;
       case 'api': await cmdApi(stok, pos[1] || ''); break;
       default: showHelp(''); process.exit(cmd ? 1 : 0);
